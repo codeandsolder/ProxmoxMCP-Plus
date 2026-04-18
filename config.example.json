@@ -1,20 +1,49 @@
 {
-    "proxmox": {
-        "host": "your-proxmox.host",
-        "port": 8006,
-        "verify_ssl": false,
-        "service": "PVE"
-    },
-    "auth": {
-        "user": "root@pam",
-        "token_name": "mcp-token",
-        "token_value": "your-token-value"
-    },
-    "ssh": {
-        "user": "pxas-agent",
-        "key_file": "~/.ssh/your-key-file",
-        "use_sudo": false,
-        "host_overrides": {},
-        "strict_host_key_checking": false
+    "default_server": "prod",
+    "servers": {
+        "prod": {
+            "proxmox": {
+                "host": "prod-proxmox.host",
+                "port": 8006,
+                "verify_ssl": false,
+                "service": "PVE"
+            },
+            "auth": {
+                "user": "root@pam",
+                "token_name": "mcp-token",
+                "token_value": "your-token-value"
+            },
+            "ssh": {
+                "user": "pxas-agent",
+                "key_file": "~/.ssh/your-key-file",
+                "use_sudo": false,
+                "host_overrides": {},
+                "strict_host_key_checking": false
+            },
+            "allowlist": [],
+            "denylist": ["new"]
+        },
+        "lab": {
+            "proxmox": {
+                "host": "lab-proxmox.host",
+                "port": 8006,
+                "verify_ssl": false,
+                "service": "PVE"
+            },
+            "auth": {
+                "user": "root@pam",
+                "token_name": "lab-token",
+                "token_value": "your-lab-token-value"
+            },
+            "ssh": {
+                "user": "pxas-agent",
+                "key_file": "~/.ssh/your-lab-key-file",
+                "use_sudo": false,
+                "host_overrides": {},
+                "strict_host_key_checking": false
+            },
+            "allowlist": [],
+            "denylist": ["new", "pve1", "200"]
+        }
     }
 }

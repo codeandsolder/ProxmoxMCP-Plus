@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "proxmox-skill"
-version = "2.0.0"
+version = "2.0.2"
 description = "Monolithic Proxmox scripting helper — single file, zero setup"
 requires-python = ">=3.11"
 dependencies = [

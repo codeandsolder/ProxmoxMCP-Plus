@@ -18,6 +18,45 @@ It turns out even the free models handle Python quite well, especially with skil
 - **Structured errors** — failures return `{reason, params, fix}` so the agent self-corrects
 - **WSL-aware** — Windows paths auto-convert to Linux mounts
 - **Secure exec** — `shlex.quote` on all commands, separated stdout/stderr, dynamic timeout
+- **Access control** — fine-grained allowlist/denylist for VMs, containers, and nodes
+
+## Access Control
+
+pxas supports fine-grained access control to prevent accidental modifications to critical infrastructure:
+
+```json
+{
+    "default_server": "prod",
+    "servers": {
+        "prod": {
+            "allowlist": [],
+            "denylist": ["new", "pve1", "100", "200"]
+        }
+    }
+}
+```
+
+### Behavior
+
+| Config | Behavior |
+|--------|----------|
+| `allowlist: []` (empty) | Denylist blocks specific IDs; everything else allowed on that server |
+| `allowlist: [100, 200]` | Only these IDs are allowed on that server |
+| `denylist: ["new"]` (default) | `create_container`/`create_vm` blocked by default on that server |
+
+### Special Identifiers
+
+- `"new"` — Controls creation of new containers/VMs. Default: in denylist.
+- Node names (e.g., `"pve1"`) — Blocks all operations on that node.
+- VMIDs (e.g., `100`, `"200"`) — Blocks operations on specific VMs/containers.
+
+### Listing Behavior
+
+Query methods (`get_containers`, `get_vms`, `get_nodes`) include a `restricted: true` flag for restricted IDs. The ID is still visible (no confusion with collisions), but the flag signals access is blocked.
+
+### Ownership Tracking
+
+When creating or restoring containers/VMs with `"new"` allowed, pxas stores a normalized source-path hash in the guest description. Subsequent runs from the same path recognize those guests automatically without needing a separate `owned_ids` config list.
 
 ## Quick Start
 
@@ -63,7 +102,7 @@ pxas -c"from pxas import nt; print(nt.get_nodes())"
 ### Scripts
 
 ```python
-from pxas import ct, nt
+from pxas import ct, nt, server
 
 for c in ct.get_containers():
     if c["status"] == "running":
@@ -73,6 +112,9 @@ result = ct.execute_command("my-app", "docker ps --format '{{.Names}}'")
 print(result["output"])
 
 ct.wait_until("my-app", "test -f /tmp/deploy.done", timeout_s=300)
+
+lab = server("lab")
+print(lab.nt.get_nodes())
 ```
 
 ### Raw proxmoxer API
@@ -84,6 +126,20 @@ nodes = px.nodes.get()
 containers = px.nodes("pve1").lxc.get()
 status = px.nodes("pve1").lxc(101).status.current.get()
 px.nodes("pve1").lxc(101).config.put(memory=2048)
+```
+
+### Multiple servers
+
+Use `default_server` plus a `servers` map in `config.json`. The default imports (`px`, `ct`, `nt`, `vt`, `st`, `bt`) bind to `default_server`. For any other server, call `server("name")`.
+
+```python
+from pxas import server
+
+prod = server("prod")
+lab = server("lab")
+
+print(prod.ct.get_containers())
+print(lab.vt.get_vms())
 ```
 
 ### Selector grammar

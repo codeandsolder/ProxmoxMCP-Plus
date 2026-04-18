@@ -13,7 +13,7 @@ export PROXMOX_SSH_KEY=~/.ssh/id_rsa
 ```
 
 ```bash
-# Option B: config file in the skill directory (recommended)
+# Option B: global skill config
 cp ~/.claude/skills/proxmox/config.example.json ~/.claude/skills/proxmox/config.json
 # Edit with your values
 ```
@@ -25,24 +25,52 @@ cp ~/.claude/skills/proxmox/config.example.json ~/.config/proxmox/config.json
 # Edit with your values
 ```
 
-`pxas` searches for `config.json` (copied to deployment directory by uv install) next to `SKILL.md` first, then `~/.config/proxmox/`. Override with `PROXMOX_CONFIG=/path/to/config.json`.
+### Per-Project Configuration
+
+For project-specific servers, copy the skill into your project:
+
+```bash
+# In your project directory
+mkdir -p .claude/skills
+cp -r ~/.claude/skills/proxmox .claude/skills/
+# Edit with project-specific settings
+```
+
+The project config at `.claude/skills/proxmox/config.json` takes priority over global configs. Each project can have its own Proxmox servers and access control settings.
+
+### Config Search Order
+
+`pxas` searches for `config.json` in this order:
+
+1. `PROXMOX_CONFIG` environment variable (override)
+2. `./.claude/skills/proxmox/config.json` (project-specific)
+3. `extra_dirs` parameter (if passed programmatically)
+4. Bundled with uv install
+5. `~/.config/proxmox/config.json`
+6. `~/.claude/skills/proxmox/config.json`
+7. Windows WSL equivalents of the above
 
 - **Config Expansion:** Use `${VAR}` in `config.json` for environment variable expansion.
 
 | Key | Env Var | Default | Description |
 |-----|---------|---------|-------------|
-| `proxmox.host` | `PROXMOX_HOST` | — | Proxmox host address |
-| `proxmox.port` | `PROXMOX_PORT` | `8006` | API port |
-| `proxmox.verify_ssl` | `PROXMOX_VERIFY_SSL` | `false` | SSL verification |
-| `auth.user` | `PROXMOX_USER` | — | e.g. `root@pam` |
-| `auth.token_name` | `PROXMOX_TOKEN_NAME` | — | API token name |
-| `auth.token_value` | `PROXMOX_TOKEN_VALUE` | — | API token secret |
-| `ssh.user` | `PROXMOX_SSH_USER` | `root` | SSH user |
-| `ssh.key_file` | `PROXMOX_SSH_KEY` | — | SSH private key path |
-| `ssh.password` | `PROXMOX_SSH_PASSWORD` | — | SSH password (not recommended) |
-| `ssh.use_sudo` | — | `false` | Prefix `pct exec` with `sudo` (required for non-root SSH users) |
-| `ssh.host_overrides` | — | `{}` | Map node names to IPs/hostnames when DNS doesn't resolve them |
-| `ssh.strict_host_key_checking` | — | `false` | Reject unknown SSH host keys (`RejectPolicy`); set `true` after adding nodes to `known_hosts` |
+| `default_server` | — | `default` | Which named server `px`, `ct`, `nt`, `vt`, `st`, and `bt` bind to |
+| `servers.<name>.proxmox.host` | `PROXMOX_HOST` | — | Proxmox host address |
+| `servers.<name>.proxmox.port` | `PROXMOX_PORT` | `8006` | API port |
+| `servers.<name>.proxmox.verify_ssl` | `PROXMOX_VERIFY_SSL` | `false` | SSL verification |
+| `servers.<name>.auth.user` | `PROXMOX_USER` | — | e.g. `root@pam` |
+| `servers.<name>.auth.token_name` | `PROXMOX_TOKEN_NAME` | — | API token name |
+| `servers.<name>.auth.token_value` | `PROXMOX_TOKEN_VALUE` | — | API token secret |
+| `servers.<name>.ssh.user` | `PROXMOX_SSH_USER` | `root` | SSH user |
+| `servers.<name>.ssh.key_file` | `PROXMOX_SSH_KEY` | — | SSH private key path |
+| `servers.<name>.ssh.password` | `PROXMOX_SSH_PASSWORD` | — | SSH password (not recommended) |
+| `servers.<name>.ssh.use_sudo` | — | `false` | Prefix `pct exec` with `sudo` (required for non-root SSH users) |
+| `servers.<name>.ssh.host_overrides` | — | `{}` | Map node names to IPs/hostnames when DNS doesn't resolve them |
+| `servers.<name>.ssh.strict_host_key_checking` | — | `false` | Reject unknown SSH host keys (`RejectPolicy`); set `true` after adding nodes to `known_hosts` |
+| `servers.<name>.allowlist` | — | `[]` | If non-empty: only these IDs are allowed on that server |
+| `servers.<name>.denylist` | — | `["new"]` | Blocked IDs on that server; `"new"` prevents container/VM creation by default |
+
+Legacy single-server configs using top-level `proxmox`, `auth`, and `ssh` still work and are treated as the default server. In that legacy format, top-level `allowlist` and `denylist` also still work.
 
 ---
 

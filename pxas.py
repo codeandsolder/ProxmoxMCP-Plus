@@ -19,6 +19,7 @@ All tool methods return native Python dicts/lists. No Content wrappers.
 
 import atexit
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import paramiko
 
@@ -133,7 +134,17 @@ def resolve_path(path: str, ensure_safe: bool = False) -> str:
 class Config:
     """Configuration container."""
 
-    __slots__ = ("proxmox", "auth", "ssh", "loaded_from", "checked_paths")
+    __slots__ = (
+        "servers",
+        "default_server",
+        "proxmox",
+        "auth",
+        "ssh",
+        "allowlist",
+        "denylist",
+        "loaded_from",
+        "checked_paths",
+    )
 
     def __init__(
         self,
@@ -142,11 +153,124 @@ class Config:
         checked_paths: Optional[List[str]] = None,
     ) -> None:
         data = _expand_env(data)
+        self.servers: Dict[str, Dict[str, Any]] = data.get("servers", {})
+        self.default_server: str = str(data.get("default_server") or "default")
         self.proxmox: Dict[str, Any] = data.get("proxmox", {})
         self.auth: Dict[str, Any] = data.get("auth", {})
         self.ssh: Optional[_SSH] = data.get("ssh")
+        self.allowlist: Set[str] = set(str(i) for i in data.get("allowlist", []))
+        self.denylist: Set[str] = set(str(i) for i in data.get("denylist", []))
         self.loaded_from: Optional[str] = loaded_from
         self.checked_paths: List[str] = checked_paths or []
+
+        if not self.servers:
+            self.servers = {
+                self.default_server: {
+                    "proxmox": self.proxmox,
+                    "auth": self.auth,
+                    "ssh": self.ssh,
+                    "allowlist": sorted(self.allowlist),
+                    "denylist": sorted(self.denylist),
+                }
+            }
+        elif self.default_server not in self.servers:
+            self.default_server = next(iter(self.servers))
+
+        default_cfg = self.get_server(self.default_server)
+        self.proxmox = default_cfg.get("proxmox", {})
+        self.auth = default_cfg.get("auth", {})
+        self.ssh = default_cfg.get("ssh")
+        self.allowlist = set(str(i) for i in default_cfg.get("allowlist", []))
+        self.denylist = set(str(i) for i in default_cfg.get("denylist", []))
+
+    def get_server(self, name: Optional[str] = None) -> Dict[str, Any]:
+        server_name = str(name or self.default_server)
+        server = self.servers.get(server_name)
+        if server is None:
+            raise KeyError(
+                f"Unknown server {server_name!r}. Available servers: {', '.join(sorted(self.servers))}"
+            )
+        return server
+
+
+def _cwd_hash(path: Optional[str] = None) -> str:
+    """Generate a SHA-256 hash of the current working directory for ownership tracking."""
+    if path is None:
+        path = os.getcwd()
+    normalized = str(Path(path).resolve())
+    if platform.system() == "Windows":
+        normalized = normalized.lower().replace("\\", "/")
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def _server_allowlist(server_cfg: Dict[str, Any]) -> Set[str]:
+    return set(str(i) for i in server_cfg.get("allowlist", []))
+
+
+def _server_denylist(server_cfg: Dict[str, Any]) -> Set[str]:
+    denylist = set(str(i) for i in server_cfg.get("denylist", []))
+    denylist.add("new")
+    return denylist
+
+
+def _is_allowed(identifier: str, server_cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    """Check if an identifier is allowed by config. Returns (allowed, reason)."""
+    denylist = _server_denylist(server_cfg)
+    allowlist = _server_allowlist(server_cfg)
+    if identifier in denylist:
+        return False, f"'{identifier}' is in denylist"
+    if allowlist:
+        if identifier in allowlist:
+            return True, f"'{identifier}' is in allowlist"
+        return False, f"'{identifier}' is not in allowlist"
+    if identifier == "new":
+        return False, "'new' is in denylist by default"
+    return True, "allowed by default"
+
+
+def _check_allowed(
+    identifier: str,
+    label: str,
+    server_cfg: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return error dict if not allowed, else None."""
+    allowed, reason = _is_allowed(identifier, server_cfg)
+    if not allowed:
+        return {
+            "error": True,
+            "reason": f"Access denied: {label} ({identifier}) - {reason}",
+            "fix": "Ask the user to update the per-server allowlist/denylist in config to allow this operation.",
+        }
+    return None
+
+
+def _check_access(
+    identifier: str,
+    label: str,
+    server_cfg: Dict[str, Any],
+    owned_hashes: Dict[str, str],
+    node: Optional[str] = None,
+    vmid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Check if identifier (and optionally node) is restricted. Returns error dict if blocked."""
+    if vmid and str(vmid) in owned_hashes:
+        return None
+    err = _check_allowed(identifier, label, server_cfg)
+    if err:
+        return err
+    if node and node != identifier:
+        return _check_allowed(node, node, server_cfg)
+    return None
+
+
+def _add_restricted_flag(
+    identifier: str, server_cfg: Dict[str, Any], owned_hashes: Dict[str, str]
+) -> bool:
+    """Return True if identifier is restricted by config rules."""
+    if identifier in owned_hashes:
+        return False
+    allowed, _ = _is_allowed(identifier, server_cfg)
+    return not allowed
 
 
 class _SSH:
@@ -218,21 +342,29 @@ def _load_config(extra_dirs: Optional[List[Path]] = None) -> Config:
     ]
 
     if not config_path:
-        # Start with explicit extra dirs
-        candidates = [d / "config.json" for d in (extra_dirs or [])]
+        candidates = []
 
-        # 1. Bundled config: Directory where pxas.py lives (via uv/hatchling)
+        # 1. Project-specific: .claude/skills/proxmox/config.json (from project root, above .claude)
+        candidates.append(Path.cwd() / ".claude" / "skills" / "proxmox" / "config.json")
+        candidates.append(Path.cwd() / ".agents" / "skills" / "proxmox" / "config.json")
+
+        # 2. Explicit extra dirs
+        candidates.extend([d / "config.json" for d in (extra_dirs or [])])
+
+        # 3. Bundled config: Directory where pxas.py lives (via uv/hatchling)
         candidates.append(script_dir / "config.json")
 
-        # 2. Fallback: Standard global user config
+        # 4. Fallback: Standard global user config
         candidates.append(Path.home() / ".config" / "proxmox" / "config.json")
         candidates.append(Path.home() / ".claude" / "skills" / "proxmox" / "config.json")
+        candidates.append(Path.home() / ".agents" / "skills" / "proxmox" / "config.json")
 
-        # 3. Fallback: Windows home if running inside WSL
+        # 5. Fallback: Windows home if running inside WSL
         win_home = _get_windows_home_in_wsl()
         if win_home:
             candidates.append(win_home / ".config" / "proxmox" / "config.json")
             candidates.append(win_home / ".claude" / "skills" / "proxmox" / "config.json")
+            candidates.append(win_home / ".agents" / "skills" / "proxmox" / "config.json")
 
         # Store string representations of the paths checked
         for c in candidates:
@@ -283,7 +415,68 @@ def _load_config(extra_dirs: Optional[List[Path]] = None) -> Config:
     ssh_raw = config_data.get("ssh", {})
     config_data["ssh"] = _load_ssh_config(ssh_raw) if ssh_raw else None
 
+    servers_raw = config_data.get("servers", {})
+    servers: Dict[str, Dict[str, Any]] = {}
+    if isinstance(servers_raw, dict):
+        for server_name, server_data in servers_raw.items():
+            if not isinstance(server_data, dict):
+                continue
+            server_ssh = server_data.get("ssh", {})
+            denylist = [str(i) for i in server_data.get("denylist", [])]
+            if "new" not in denylist:
+                denylist.append("new")
+            servers[str(server_name)] = {
+                "proxmox": server_data.get("proxmox", {}),
+                "auth": server_data.get("auth", {}),
+                "ssh": _load_ssh_config(server_ssh) if server_ssh else None,
+                "allowlist": [str(i) for i in server_data.get("allowlist", [])],
+                "denylist": denylist,
+            }
+    if servers:
+        config_data["servers"] = servers
+
+    if not servers:
+        denylist = [str(i) for i in config_data.get("denylist", [])]
+        if "new" not in denylist:
+            denylist.append("new")
+        config_data["denylist"] = denylist
+        config_data["allowlist"] = [str(i) for i in config_data.get("allowlist", [])]
+
     return Config(config_data, loaded_from=found_at, checked_paths=checked_paths)
+
+
+def _load_ownership_hashes(px: Any) -> Dict[str, str]:
+    """Scan all containers and VMs, extract pxas:owned hashes into _owned_hashes."""
+    owned_hashes: Dict[str, str] = {}
+    try:
+        nodes = [_get(n, "node") for n in _as_list(px.nodes.get()) if _get(n, "node")]
+    except Exception:
+        return owned_hashes
+    for node in nodes:
+        for resource_type in ("lxc", "qemu"):
+            try:
+                items = _as_list(getattr(px.nodes(node), resource_type).get())
+            except Exception:
+                continue
+            for item in items:
+                vmid = _get(item, "vmid")
+                if not vmid:
+                    continue
+                try:
+                    desc = _as_dict(getattr(px.nodes(node), resource_type)(vmid).config.get()).get(
+                        "description", ""
+                    )
+                    marker = "pxas:owned"
+                    if marker not in desc:
+                        continue
+                    for part in desc.split(marker):
+                        if "hash=" in part:
+                            stored_hash = part.split("hash=")[-1].split("|")[0].strip()
+                            owned_hashes[str(vmid)] = stored_hash
+                            break
+                except Exception:
+                    continue
+    return owned_hashes
 
 
 # ---------------------------------------------------------------------------
@@ -703,11 +896,49 @@ def _resolve_selector(
 class _BaseTools:
     """Base class for Resource Tools with common selector and listing logic."""
 
-    def __init__(self, proxmox_api: Any) -> None:
+    def __init__(
+        self,
+        proxmox_api: Any,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.px = proxmox_api
+        self.server_cfg = server_cfg or {}
+        self.owned_hashes = owned_hashes if owned_hashes is not None else {}
 
     _target_type: str = "targets"
     _resource_type: str = ""  # "lxc" or "qemu" — set by subclass
+
+    def _check_restriction(
+        self, identifier: str, label: str, node: Optional[str] = None, vmid: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Check if an identifier is restricted. Returns error dict if blocked, else None."""
+        return _check_access(identifier, label, self.server_cfg, self.owned_hashes, node, vmid)
+
+    def _add_restricted_flag(self, identifier: str) -> bool:
+        """Check if an identifier is restricted. Returns True if restricted."""
+        return _add_restricted_flag(identifier, self.server_cfg, self.owned_hashes)
+
+    def _store_ownership_hash(self, node: str, vmid: str, resource_type: str) -> None:
+        """Store the current working directory hash in the container/VM description."""
+        try:
+            path_hash = _cwd_hash()
+            cwd = os.getcwd()
+            existing = _as_dict(getattr(self.px.nodes(node), resource_type)(vmid).config.get()).get(
+                "description", ""
+            )
+            marker = "pxas:owned"
+            if marker in existing:
+                before, _, after = existing.partition(marker)
+                existing = before.rstrip()
+                after_marker = after.split("|", 1)[-1] if "|" in after else ""
+                if after_marker:
+                    existing = f"{existing} {after_marker}".strip()
+            new_desc = f"{existing} {marker} path={cwd}|hash={path_hash}".strip()
+            getattr(self.px.nodes(node), resource_type)(vmid).config.put(description=new_desc)
+            self.owned_hashes[str(vmid)] = path_hash
+        except Exception:
+            pass
 
     def _list_pairs(self, node: Optional[str] = None) -> List[Tuple[str, Dict]]:
         """Return [(node_name, resource_dict), ...] for all or one node."""
@@ -754,6 +985,10 @@ class _BaseTools:
             return {"error": True, "reason": f"No {self._target_type} matched selector: {selector}"}
         results = []
         for node, vmid, label in targets:
+            restricted = self._check_restriction(str(vmid), label, node, vmid)
+            if restricted:
+                results.append(restricted)
+                continue
             if pre_check:
                 check_result = pre_check(node, vmid, label)
                 if check_result:
@@ -979,8 +1214,14 @@ class ContainerTools(_BaseTools):
     _target_type = "containers"
     _resource_type = "lxc"
 
-    def __init__(self, proxmox_api: Any, ssh_config: Optional[_SSH] = None) -> None:
-        super().__init__(proxmox_api)
+    def __init__(
+        self,
+        proxmox_api: Any,
+        ssh_config: Optional[_SSH] = None,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(proxmox_api, server_cfg=server_cfg, owned_hashes=owned_hashes)
         self.exec_ = ContainerExec(proxmox_api, ssh_config) if ssh_config else None
         self.log = logging.getLogger("pxas.ct")
 
@@ -1039,6 +1280,8 @@ class ContainerTools(_BaseTools):
             "status": _get(ct, "status"),
         }
         if not include_stats or vmid_int is None:
+            if vmid_raw is not None:
+                rec["restricted"] = self._add_restricted_flag(str(vmid_raw))
             return rec
         raw_s, raw_c = self._status_config(node, vmid_int)
         cpu_pct = _round(float(_get(raw_s, "cpu", 0) or 0) * 100.0)
@@ -1103,6 +1346,9 @@ class ContainerTools(_BaseTools):
         rec["maxmem_bytes"] = maxmem_bytes
         rec["mem_pct"] = _round(mem_bytes / maxmem_bytes * 100.0) if maxmem_bytes > 0 else None
         rec["unlimited_memory"] = unlimited
+        rec["restricted"] = (
+            self._add_restricted_flag(str(vmid_raw)) if vmid_raw is not None else False
+        )
         return rec
 
     # -- public API --
@@ -1128,6 +1374,7 @@ class ContainerTools(_BaseTools):
                         "name": _get(r, "name") or f"ct-{_get(r, 'vmid')}",
                         "node": _get(r, "node"),
                         "status": _get(r, "status"),
+                        "restricted": self._add_restricted_flag(str(_get(r, "vmid"))),
                     }
                     for r in resources
                 ]
@@ -1153,6 +1400,7 @@ class ContainerTools(_BaseTools):
                     "mem_pct": _round(_get(r, "mem", 0) / _get(r, "maxmem", 1) * 100.0)
                     if _get(r, "maxmem")
                     else 0,
+                    "restricted": self._add_restricted_flag(str(vmid)),
                 }
 
                 # Only drill down if realtime or missing critical info
@@ -1362,6 +1610,11 @@ class ContainerTools(_BaseTools):
             }
         results = []
         for node, vmid, label in targets:
+            restricted = self._check_restriction(str(vmid), label, node)
+            if restricted:
+                restricted["success"] = False
+                results.append(restricted)
+                continue
             rec: Dict[str, Any] = {
                 "success": True,
                 "node": node,
@@ -1445,6 +1698,10 @@ class ContainerTools(_BaseTools):
         timeout_s: int = 300,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        new_check = self._check_restriction("new", "create_container", node)
+        if new_check:
+            new_check["success"] = False
+            return new_check
         conflict = _check_vmid_free(self.px, vmid)
         if conflict:
             return conflict
@@ -1518,6 +1775,8 @@ class ContainerTools(_BaseTools):
             base["success"] = r.get("success", False)
             base["output"] = r.get("output", "")
             base["elapsed"] = r.get("elapsed", 0)
+            if base["success"]:
+                self._store_ownership_hash(node, vmid, "lxc")
         else:
             base["task"] = r if isinstance(r, str) else ""
         return base
@@ -1539,6 +1798,11 @@ class ContainerTools(_BaseTools):
             }
         results = []
         for node, vmid, label in targets:
+            restricted = self._check_restriction(str(vmid), label, node)
+            if restricted:
+                restricted["success"] = False
+                results.append(restricted)
+                continue
             rec: Dict[str, Any] = {
                 "success": True,
                 "node": node,
@@ -1575,6 +1839,8 @@ class ContainerTools(_BaseTools):
                     rec["success"] = r.get("success", False)
                     rec["output"] = r.get("output", "")
                     rec["elapsed"] = r.get("elapsed", 0)
+                    if rec["success"]:
+                        self.owned_hashes.pop(str(vmid), None)
                 else:
                     rec["task"] = upid
             except Exception as e:
@@ -1592,8 +1858,18 @@ class ContainerTools(_BaseTools):
 class NodeTools:
     """Proxmox node operations — returns native dicts/lists."""
 
-    def __init__(self, proxmox_api: Any) -> None:
+    def __init__(
+        self,
+        proxmox_api: Any,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.px = proxmox_api
+        self.server_cfg = server_cfg or {}
+        self.owned_hashes = owned_hashes if owned_hashes is not None else {}
+
+    def _add_restricted_flag(self, identifier: str) -> bool:
+        return _add_restricted_flag(identifier, self.server_cfg, self.owned_hashes)
 
     @px_error
     def get_nodes(self) -> List[Dict]:
@@ -1616,6 +1892,7 @@ class NodeTools:
                 else None,
                 "disk_used": _get(n, "diskused", 0),
                 "disk_total": _get(n, "maxdisk", 0),
+                "restricted": self._add_restricted_flag(name),
             }
             nodes.append(rec)
         return nodes
@@ -1667,19 +1944,28 @@ class VMTools(_BaseTools):
     _target_type = "VMs"
     _resource_type = "qemu"
 
-    def __init__(self, proxmox_api: Any) -> None:
-        super().__init__(proxmox_api)
+    def __init__(
+        self,
+        proxmox_api: Any,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(proxmox_api, server_cfg=server_cfg, owned_hashes=owned_hashes)
 
     def _vm_status(self, node: str, vmid: int) -> str:
         """Return the current status string for a VM (e.g. 'running', 'stopped')."""
         return _get(_as_dict(self.px.nodes(node).qemu(vmid).status.current.get()), "status") or ""
 
-    def _vm_stopped_pre_check(
-        self, node: str, vmid: int, label: str
-    ) -> Optional[Dict[str, Any]]:
+    def _vm_stopped_pre_check(self, node: str, vmid: int, label: str) -> Optional[Dict[str, Any]]:
         """Return an already_stopped result if the VM is stopped, else None."""
         if self._vm_status(node, vmid) == "stopped":
-            return {"vmid": str(vmid), "node": node, "name": label, "status": "already_stopped", "success": True}
+            return {
+                "vmid": str(vmid),
+                "node": node,
+                "name": label,
+                "status": "already_stopped",
+                "success": True,
+            }
         return None
 
     @px_error
@@ -1692,9 +1978,10 @@ class VMTools(_BaseTools):
 
             results = []
             for r in resources:
+                vmid = str(_get(r, "vmid"))
                 results.append(
                     {
-                        "vmid": str(_get(r, "vmid")),
+                        "vmid": vmid,
                         "name": _get(r, "name"),
                         "status": _get(r, "status"),
                         "node": _get(r, "node"),
@@ -1702,6 +1989,7 @@ class VMTools(_BaseTools):
                         "mem_bytes": _get(r, "mem", 0),
                         "maxmem_bytes": _get(r, "maxmem", 0),
                         "cpu_pct": _round(float(_get(r, "cpu", 0) or 0) * 100.0),
+                        "restricted": self._add_restricted_flag(vmid),
                     }
                 )
             return results
@@ -1728,6 +2016,7 @@ class VMTools(_BaseTools):
                         "mem_bytes": mem_bytes,
                         "maxmem_bytes": maxmem_bytes,
                         "cpu_pct": _round(float(_get(vm, "cpu", 0) or 0) * 100.0),
+                        "restricted": self._add_restricted_flag(str(vmid)),
                     }
                 )
             return vms
@@ -1744,7 +2033,13 @@ class VMTools(_BaseTools):
             selector,
             action=lambda n, v: str(self.px.nodes(n).qemu(v).status.start.post()),
             pre_check=lambda n, v, label: (
-                {"vmid": str(v), "node": n, "name": label, "status": "already_running", "success": True}
+                {
+                    "vmid": str(v),
+                    "node": n,
+                    "name": label,
+                    "status": "already_running",
+                    "success": True,
+                }
                 if self._vm_status(n, v) == "running"
                 else None
             ),
@@ -1799,9 +2094,14 @@ class VMTools(_BaseTools):
             selector,
             action=lambda n, v: str(self.px.nodes(n).qemu(v).status.reset.post()),
             pre_check=lambda n, v, label: (
-                {"error": True, "node": n, "vmid": str(v), "name": label,
-                 "reason": f"VM {v} is stopped. Use start_vm first.",
-                 "fix": "Start the VM before resetting."}
+                {
+                    "error": True,
+                    "node": n,
+                    "vmid": str(v),
+                    "name": label,
+                    "reason": f"VM {v} is stopped. Use start_vm first.",
+                    "fix": "Start the VM before resetting.",
+                }
                 if self._vm_status(n, v) == "stopped"
                 else None
             ),
@@ -1892,6 +2192,11 @@ class VMTools(_BaseTools):
             return {"error": True, "reason": f"No {self._target_type} matched selector: {selector}"}
         results = []
         for node, vmid, label in targets:
+            restricted = self._check_restriction(str(vmid), label, node)
+            if restricted:
+                restricted["success"] = False
+                results.append(restricted)
+                continue
             status = _as_dict(self.px.nodes(node).qemu(vmid).status.current.get())
             cur = _get(status, "status")
             name = _get(status, "name") or label
@@ -1937,6 +2242,8 @@ class VMTools(_BaseTools):
                 res["success"] = r.get("success", False)
                 res["output"] = r.get("output", "")
                 res["elapsed"] = r.get("elapsed", 0)
+                if res["success"]:
+                    self.owned_hashes.pop(str(vmid), None)
             else:
                 res["status"] = "deletion_initiated"
                 res["task"] = r if isinstance(r, str) else ""
@@ -1959,6 +2266,10 @@ class VMTools(_BaseTools):
         timeout_s: int = 120,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        new_check = self._check_restriction("new", "create_vm", node)
+        if new_check:
+            new_check["success"] = False
+            return new_check
         conflict = _check_vmid_free(self.px, vmid)
         if conflict:
             return conflict
@@ -2023,6 +2334,8 @@ class VMTools(_BaseTools):
             base["success"] = r.get("success", False)
             base["output"] = r.get("output", "")
             base["elapsed"] = r.get("elapsed", 0)
+            if base["success"]:
+                self._store_ownership_hash(node, vmid, "qemu")
         else:
             base["task"] = r if isinstance(r, str) else ""
         return base
@@ -2043,6 +2356,11 @@ class VMTools(_BaseTools):
             }
         results = []
         for node, vmid, label in targets:
+            restricted = self._check_restriction(str(vmid), label, node)
+            if restricted:
+                restricted["success"] = False
+                results.append(restricted)
+                continue
             params: Dict[str, Any] = {}
             changes: List[str] = []
             if cores is not None:
@@ -2095,8 +2413,20 @@ class VMTools(_BaseTools):
 class SnapshotTools:
     """Snapshot operations for VMs and containers."""
 
-    def __init__(self, proxmox_api: Any) -> None:
+    def __init__(
+        self,
+        proxmox_api: Any,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.px = proxmox_api
+        self.server_cfg = server_cfg or {}
+        self.owned_hashes = owned_hashes if owned_hashes is not None else {}
+
+    def _check_restriction(
+        self, identifier: str, label: str, node: Optional[str] = None, vmid: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        return _check_access(identifier, label, self.server_cfg, self.owned_hashes, node, vmid)
 
     def _endpoint(self, node: str, vmid: str, vm_type: str):
         if vm_type == "lxc":
@@ -2136,6 +2466,10 @@ class SnapshotTools:
         timeout_s: int = 60,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        restricted = self._check_restriction(vmid, f"{vm_type}:{vmid}", node)
+        if restricted:
+            restricted["success"] = False
+            return restricted
         params: Dict[str, str | int] = {"snapname": snapname}
         if description:
             params["description"] = description
@@ -2170,6 +2504,10 @@ class SnapshotTools:
         timeout_s: int = 60,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        restricted = self._check_restriction(vmid, f"{vm_type}:{vmid}", node)
+        if restricted:
+            restricted["success"] = False
+            return restricted
         ep = self._endpoint
         r = _run_with_retry(
             self.px,
@@ -2199,6 +2537,10 @@ class SnapshotTools:
         timeout_s: int = 60,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        restricted = self._check_restriction(vmid, f"{vm_type}:{vmid}", node)
+        if restricted:
+            restricted["success"] = False
+            return restricted
         endpoint = self._endpoint(node, vmid, vm_type)
         snaps = _as_list(endpoint.get())
         deleted: List[str] = []
@@ -2244,8 +2586,20 @@ class SnapshotTools:
 class BackupTools:
     """Backup and restore operations."""
 
-    def __init__(self, proxmox_api: Any) -> None:
+    def __init__(
+        self,
+        proxmox_api: Any,
+        server_cfg: Optional[Dict[str, Any]] = None,
+        owned_hashes: Optional[Dict[str, str]] = None,
+    ) -> None:
         self.px = proxmox_api
+        self.server_cfg = server_cfg or {}
+        self.owned_hashes = owned_hashes if owned_hashes is not None else {}
+
+    def _check_restriction(
+        self, identifier: str, label: str, node: Optional[str] = None, vmid: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        return _check_access(identifier, label, self.server_cfg, self.owned_hashes, node, vmid)
 
     @px_error
     def list_backups(
@@ -2331,6 +2685,10 @@ class BackupTools:
         timeout_s: int = 300,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        restricted = self._check_restriction(vmid, f"backup:{vmid}", node)
+        if restricted:
+            restricted["success"] = False
+            return restricted
         params: Dict[str, str] = {
             "vmid": str(vmid),
             "storage": storage,
@@ -2374,6 +2732,14 @@ class BackupTools:
         timeout_s: int = 300,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        new_check = self._check_restriction("new", "restore", node)
+        if new_check:
+            new_check["success"] = False
+            return new_check
+        restricted = self._check_restriction(vmid, f"restore:{vmid}", node)
+        if restricted:
+            restricted["success"] = False
+            return restricted
         is_lxc = "/ct/" in archive.lower() or "vzdump-lxc" in archive.lower()
         if is_lxc:
             params: Dict[str, str | int] = {"ostemplate": archive, "vmid": int(vmid), "restore": 1}
@@ -2400,12 +2766,15 @@ class BackupTools:
             base["success"] = r.get("success", False)
             base["output"] = r.get("output", "")
             base["elapsed"] = r.get("elapsed", 0)
+            if base["success"]:
+                resource_type = "lxc" if is_lxc else "qemu"
+                self._store_ownership_hash(node, vmid, resource_type)
         else:
             base["task"] = r if isinstance(r, str) else ""
         return base
 
     def _resolve_backup_volid(self, node: str, volid: str) -> Dict[str, Any]:
-        """Resolve a possibly-ambiguous volid to a canonical {volid, storage} or {error}.
+        """Resolve a possibly-ambiguous volid to a canonical {volid, storage, vmid} or {error}.
 
         Accepts:
           - Fully qualified:  "local:backup/vzdump-qemu-101-....vma.zst"
@@ -2413,12 +2782,20 @@ class BackupTools:
           - Bare filename:    "vzdump-qemu-101-....vma.zst"
           - Partial match:    "101-2026_03_25" (must resolve to exactly one backup)
         """
+
+        def _extract_vmid(v: str) -> str:
+            fname = v.split(":", 1)[-1] if ":" in v else v
+            parts = fname.split("-")
+            if len(parts) >= 3 and parts[0] == "vzdump" and parts[1] in ("lxc", "qemu"):
+                return parts[2]
+            return ""
+
         needle = volid.strip()
 
         # If it looks fully-qualified (storage:path), trust it directly
         if ":" in needle:
             storage = needle.split(":", 1)[0]
-            return {"volid": needle, "storage": storage}
+            return {"volid": needle, "storage": storage, "vmid": _extract_vmid(needle)}
 
         # Otherwise search all backup storages for a filename match
         matches: List[Dict[str, str]] = []
@@ -2433,7 +2810,13 @@ class BackupTools:
                     item_volid = _get(item, "volid", "")
                     fname = item_volid.split(":", 1)[-1] if ":" in item_volid else item_volid
                     if needle in fname or needle in item_volid:
-                        matches.append({"volid": item_volid, "storage": sname})
+                        matches.append(
+                            {
+                                "volid": item_volid,
+                                "storage": sname,
+                                "vmid": _extract_vmid(item_volid),
+                            }
+                        )
             except Exception:
                 continue  # Storage unavailable during search; skip and check remaining
 
@@ -2466,6 +2849,12 @@ class BackupTools:
             return resolved
         actual_volid: str = resolved["volid"]
         actual_storage: str = resolved["storage"]
+        backup_vmid = resolved.get("vmid", "")
+        if backup_vmid:
+            restricted = self._check_restriction(backup_vmid, f"backup:{backup_vmid}", node)
+            if restricted:
+                restricted["success"] = False
+                return restricted
 
         content = _as_list(
             self.px.nodes(node).storage(actual_storage).content.get(content="backup")
@@ -2525,7 +2914,7 @@ cfg = _load_config()
 
 # Late import: proxmoxer is only available after uv installs it as a dependency.
 # cfg = _load_config() above runs at import time and must succeed before the API client is needed.
-from proxmoxer import ProxmoxAPI, ResourceException  # noqa: E402
+from proxmoxer import ProxmoxAPI  # noqa: E402
 
 
 def _connect(c: Config) -> ProxmoxAPI:
@@ -2539,31 +2928,56 @@ def _connect(c: Config) -> ProxmoxAPI:
     )
 
 
-class _LazyProxy:
-    """Lazy-load the connection on first access."""
+class _ServerProxy:
+    """Lazy-load a single named server connection on first access."""
 
-    _instance: Optional["_LazyProxy"] = None
-    _connected: bool = False
+    def __init__(self, server_name: Optional[str] = None, config: Optional[Config] = None) -> None:
+        self.cfg = config or cfg
+        self.server_name = str(server_name or self.cfg.default_server)
+        self._connected = False
 
-    def __new__(cls) -> "_LazyProxy":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def _server_config(self) -> Dict[str, Any]:
+        return self.cfg.get_server(self.server_name)
 
     def _ensure_connection(self) -> None:
         if self._connected:
             return
-        if not cfg.proxmox.get("host"):
+        server_cfg = self._server_config()
+        proxmox_cfg = server_cfg.get("proxmox", {})
+        auth_cfg = server_cfg.get("auth", {})
+        ssh_cfg = server_cfg.get("ssh")
+        allowlist = [str(i) for i in server_cfg.get("allowlist", [])]
+        denylist = [str(i) for i in server_cfg.get("denylist", [])]
+        if not proxmox_cfg.get("host"):
             raise RuntimeError(
-                "Proxmox not configured. Set PROXMOX_HOST or create config.json.\n"
-                "Checked locations:\n  - " + "\n  - ".join(cfg.checked_paths)
+                f"Proxmox server {self.server_name!r} is not configured. "
+                "Set PROXMOX_HOST or create config.json.\n"
+                "Checked locations:\n  - " + "\n  - ".join(self.cfg.checked_paths)
             )
-        self._px = _connect(cfg)
-        self._ct = ContainerTools(self._px, cfg.ssh)
-        self._nt = NodeTools(self._px)
-        self._vt = VMTools(self._px)
-        self._st = SnapshotTools(self._px)
-        self._bt = BackupTools(self._px)
+        connection_cfg = Config(
+            {
+                "servers": {self.server_name: server_cfg},
+                "default_server": self.server_name,
+                "proxmox": proxmox_cfg,
+                "auth": auth_cfg,
+                "ssh": ssh_cfg,
+                "allowlist": allowlist,
+                "denylist": denylist,
+            },
+            loaded_from=self.cfg.loaded_from,
+            checked_paths=self.cfg.checked_paths,
+        )
+        self._px = _connect(connection_cfg)
+        self._owned_hashes = _load_ownership_hashes(self._px)
+        self._ct = ContainerTools(
+            self._px, ssh_cfg, server_cfg=server_cfg, owned_hashes=self._owned_hashes
+        )
+        self._nt = NodeTools(self._px, server_cfg=server_cfg, owned_hashes=self._owned_hashes)
+        self._vt = VMTools(self._px, server_cfg=server_cfg, owned_hashes=self._owned_hashes)
+        self._st = SnapshotTools(
+            self._px, server_cfg=server_cfg, owned_hashes=self._owned_hashes
+        )
+        self._bt = BackupTools(self._px, server_cfg=server_cfg, owned_hashes=self._owned_hashes)
         self._connected = True
         atexit.register(self._ct.close)
 
@@ -2598,7 +3012,49 @@ class _LazyProxy:
         return self._bt
 
 
-_pxas = _LazyProxy()
+class _ServerRegistry:
+    """Cache per-server proxies and expose the default one for legacy imports."""
+
+    def __init__(self, config: Optional[Config] = None) -> None:
+        self.cfg = config or cfg
+        self._proxies: Dict[str, _ServerProxy] = {}
+
+    def server(self, name: Optional[str] = None) -> _ServerProxy:
+        server_name = str(name or self.cfg.default_server)
+        if server_name not in self._proxies:
+            self._proxies[server_name] = _ServerProxy(server_name, self.cfg)
+        return self._proxies[server_name]
+
+    @property
+    def px(self) -> ProxmoxAPI:
+        return self.server().px
+
+    @property
+    def ct(self) -> ContainerTools:
+        return self.server().ct
+
+    @property
+    def nt(self) -> NodeTools:
+        return self.server().nt
+
+    @property
+    def vt(self) -> VMTools:
+        return self.server().vt
+
+    @property
+    def st(self) -> SnapshotTools:
+        return self.server().st
+
+    @property
+    def bt(self) -> BackupTools:
+        return self.server().bt
+
+
+def server(name: Optional[str] = None) -> _ServerProxy:
+    return _pxas.server(name)
+
+
+_pxas = _ServerRegistry()
 
 
 def __getattr__(name: str):
@@ -2614,6 +3070,8 @@ def __getattr__(name: str):
         return _pxas.st
     if name == "bt":
         return _pxas.bt
+    if name == "server":
+        return server
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -2630,29 +3088,42 @@ def main():
     parser.add_argument("script", nargs="?", help="Python script file to run")
     args = parser.parse_args()
 
+    _registry = _pxas
     _ns = {
-        "px": _pxas.px,
-        "ct": _pxas.ct,
-        "nt": _pxas.nt,
-        "vt": _pxas.vt,
-        "st": _pxas.st,
-        "bt": _pxas.bt,
+        "px": _registry.px,
+        "ct": _registry.ct,
+        "nt": _registry.nt,
+        "vt": _registry.vt,
+        "st": _registry.st,
+        "bt": _registry.bt,
         "cfg": cfg,
+        "server": _registry.server,
     }
 
     if args.command or args.script:
         _cfg = cfg
-        _px, _ct, _nt, _vt, _st, _bt = _pxas.px, _pxas.ct, _pxas.nt, _pxas.vt, _pxas.st, _pxas.bt
+        _registry = _pxas
+        _px, _ct, _nt, _vt, _st, _bt = (
+            _registry.px,
+            _registry.ct,
+            _registry.nt,
+            _registry.vt,
+            _registry.st,
+            _registry.bt,
+        )
         if args.script:
             script_dir = Path(args.script).resolve().parent
             _cfg = _load_config(extra_dirs=[script_dir])
-            if _cfg.proxmox.get("host") and _cfg.proxmox.get("host") != cfg.proxmox.get("host"):
-                _px = _connect(_cfg)
-                _ct = ContainerTools(_px, _cfg.ssh)
-                _nt = NodeTools(_px)
-                _vt = VMTools(_px)
-                _st = SnapshotTools(_px)
-                _bt = BackupTools(_px)
+            if _cfg.loaded_from != cfg.loaded_from or _cfg.default_server != cfg.default_server:
+                _registry = _ServerRegistry(_cfg)
+                default_proxy = _registry.server()
+                if default_proxy._server_config().get("proxmox", {}).get("host"):
+                    _px = default_proxy.px
+                    _ct = default_proxy.ct
+                    _nt = default_proxy.nt
+                    _vt = default_proxy.vt
+                    _st = default_proxy.st
+                    _bt = default_proxy.bt
         if _px is None:
             _ns = {
                 "px": None,
@@ -2662,9 +3133,19 @@ def main():
                 "st": None,
                 "bt": None,
                 "cfg": _cfg,
+                "server": _registry.server,
             }
         else:
-            _ns = {"px": _px, "ct": _ct, "nt": _nt, "vt": _vt, "st": _st, "bt": _bt, "cfg": _cfg}
+            _ns = {
+                "px": _px,
+                "ct": _ct,
+                "nt": _nt,
+                "vt": _vt,
+                "st": _st,
+                "bt": _bt,
+                "cfg": _cfg,
+                "server": _registry.server,
+            }
         if args.command:
             exec(args.command, _ns)
         else:
